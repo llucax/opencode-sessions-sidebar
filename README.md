@@ -1,16 +1,20 @@
 # opencode sessions watch
 
-Two TUI plugins for [opencode](https://opencode.ai) that tell you what your
-other sessions are doing: one passively, as a panel in the sidebar, and one by
-interrupting you with a toast when a session you are not looking at starts
-wanting something.
+Three TUI plugins for [opencode](https://opencode.ai) that tell you what your
+other sessions are doing, and get you to one of them quickly: two watch
+passively, one as a panel in the sidebar and one by interrupting you with a
+toast when a session you are not looking at starts wanting something; the
+third gets you there, toggling back to the session you were in before this
+one the way tapping Alt+Tab once switches between the two most recent windows.
 
 | Plugin                                  | File                   | What it does                                             |
-|-----------------------------------------|------------------------|----------------------------------------------------------|
+|------------------------------------------|------------------------|------------------------------------------------------------|
 | [sessions-sidebar](#sessions-sidebar)   | `sessions-sidebar.tsx` | lists the project's sessions in the sidebar, by state    |
 | [sessions-toast](#sessions-toast)       | `sessions-toast.tsx`   | toasts a session that needs you while you are elsewhere  |
+| [sessions-switch](#sessions-switch)     | `sessions-switch.tsx`  | toggles back to the session you were in before this one  |
 
-They share no code and are installed separately, so take either or both.
+They share no code and are installed separately, so take any one, two, or all
+three.
 
 Developed against opencode 1.18.25. They need a version carrying the TUI plugin
 API, and the sidebar additionally needs its `sidebar_content` slot. There is
@@ -29,6 +33,7 @@ Symlink the plugins you want into your opencode plugin directory:
     mkdir -p ~/.config/opencode/plugins
     ln -s "$PWD/opencode-sessions-watch/sessions-sidebar.tsx" \
           "$PWD/opencode-sessions-watch/sessions-toast.tsx" \
+          "$PWD/opencode-sessions-watch/sessions-switch.tsx" \
           ~/.config/opencode/plugins/
 
 Then register them in `~/.config/opencode/tui.jsonc`, creating the file if you
@@ -38,7 +43,8 @@ do not have one:
       "$schema": "https://opencode.ai/tui.json",
       "plugin": [
         "./plugins/sessions-sidebar.tsx",
-        "./plugins/sessions-toast.tsx"
+        "./plugins/sessions-toast.tsx",
+        "./plugins/sessions-switch.tsx"
       ]
     }
 
@@ -63,7 +69,8 @@ defaults.
 
     "plugin": [
       ["./plugins/sessions-sidebar.tsx", { "idleMaxAge": "2h", "showCurrent": true }],
-      ["./plugins/sessions-toast.tsx", { "retryAfter": "1m" }]
+      ["./plugins/sessions-toast.tsx", { "retryAfter": "1m" }],
+      ["./plugins/sessions-switch.tsx", { "switchKey": "f9" }]
     ]
 
 Durations are written throughout as a string pairing a number with a unit, one
@@ -307,6 +314,67 @@ as the only way in.
 | `duration`   | `"5s"`             | full duration; queued toasts get half of it                     |
 | `jumpKey`    | `"<leader>space"`  | sequence for the jump command, `false` to disable               |
 
+## `sessions-switch`
+
+Toggles back to the session you were in before this one, the way tapping
+Alt+Tab once switches between the two most recent windows: press it again and
+you bounce right back. Bound to `ctrl+space` by default, and also reachable
+from the command palette under `Session`, as *Switch to the previous session*.
+
+It tracks two sessions, not a longer history: wherever you are now, and
+wherever you were before that. A longer list raises the question of what a
+second, third, fourth press should do, and Alt+Tab's whole appeal is that one
+key answers that without a dialog. `sessions-toast`'s `<leader>space` jumps to
+whichever session last needed you; `session_list` (`<leader>l`) picks from
+everything. This plugin is for the specific, frequent case of "take me back to
+the one I was just looking at", from either of the other two or from anywhere
+else.
+
+The switch counts as any navigation to a session route, including one made by
+opencode's own session picker, a quick-switch slot, or the child/parent
+navigation keys, not only this plugin's own command. It does not distinguish
+where you came from.
+
+### How it notices a switch
+
+opencode's plugin API has no event for "the TUI now shows a different
+session": the session events on the bus
+(`session.created/updated/deleted/status/idle/error`) all fire because
+something happened to a session, not because you looked at it, and
+`route.current` is a plain getter a plugin can read but not subscribe to. So
+this plugin samples it on a 100ms timer instead of being told.
+
+That sampling has one real consequence: two switches, made by something else,
+that land closer together than 100ms apart collapse into one hop, and the
+session in between is skipped rather than becoming the one toggled back to.
+Picking sessions by hand, through a dialog, does not move that fast; only
+another program driving opencode's API directly plausibly could.
+
+Pressing the switch key itself is not subject to that lag: it re-samples
+before deciding where to go, so bouncing back and forth by hand is instant
+however fast you press it.
+
+### What it stays quiet about
+
+A session deleted while it was tracked as the one to switch to is dropped
+rather than offered: toggling into it would otherwise fail the same way on
+every press. If it was the one you were on, whichever one was tracked before
+it takes its place, so the toggle target is never worse than one step stale.
+
+### Options
+
+| Option      | Default        | Meaning                                                    |
+|-------------|----------------|-------------------------------------------------------------|
+| `switchKey` | `"ctrl+space"` | sequence for the toggle command, `false` to disable         |
+
+Not verified against every terminal: some terminal emulators and multiplexers
+send Ctrl+Space as a NUL byte rather than a distinguishable key, in which case
+nothing here will fire. If pressing it does nothing, first check whether
+*Switch to the previous session* in the command palette works: if it does, the
+logic is fine and only the key is not reaching opencode, so set `switchKey` to
+something else, such as `"f9"` or `"<leader>space"` freed up by disabling
+`sessions-toast`'s `jumpKey`.
+
 ## Updating
 
     git -C /path/to/opencode-sessions-watch pull
@@ -336,8 +404,9 @@ Remove the symlink and the `tui.jsonc` entry, then restart opencode.
 
 Each plugin file is self-contained, with no shared module between them, because
 the convention above is "symlink the plugin file" and a shared import would
-break it. The duplication is a duration parser and a handful of `api.event.on`
-lines; a module to save them would cost more than it returns.
+break it. The duplication is a duration parser, the `log()` helper, and a
+handful of `api.event.on` lines; a module to save them would cost more than it
+returns.
 
 Do not install `solid-js` or `@opentui/solid` next to a plugin when it runs
 inside opencode. opencode rewrites those specifiers to its own already-loaded
@@ -356,8 +425,9 @@ Colour goes on the whole row because `<span>` carries no style options.
     bun run typecheck
     bun test
 
-`tsconfig.json` type-checks both plugins against the real `@opencode-ai/plugin`
-and `@opentui/solid` types, pinned to the versions opencode itself loads.
+`tsconfig.json` type-checks all three plugins against the real
+`@opencode-ai/plugin` and `@opentui/solid` types, pinned to the versions
+opencode itself loads.
 `bunfig.toml` preloads `@opentui/solid/preload` for `bun test`, which gives
 tests the same Solid transform opencode runs plugin sources through; a
 top-level `preload` key is not enough, only the one under `[test]` is read.
@@ -366,8 +436,9 @@ top-level `preload` key is not enough, only the one under `[test]` is read.
 alongside the plugin's own `default`, purely so tests can reach them; opencode
 only ever reads `module.default`; the extra names are otherwise inert.
 `test/fake-api.ts` builds a narrow `TuiPluginApi` fake and a fake clock so the
-stateful cores (`createModel`, `createWatcher`) can be driven through the
-event stream and through time without a live TUI or a real sleep.
+stateful cores (`createModel`, `createWatcher`, `createSwitcher`) can be
+driven through the event stream and through time without a live TUI or a real
+sleep.
 
 ## License
 

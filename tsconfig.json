@@ -11,5 +11,5 @@
     "jsxImportSource": "@opentui/solid",
     "types": ["bun"]
   },
-  "include": ["sessions-sidebar.tsx", "sessions-toast.tsx", "test/**/*.ts"]
+  "include": ["sessions-sidebar.tsx", "sessions-toast.tsx", "sessions-switch.tsx", "test/**/*.ts"]
 }
