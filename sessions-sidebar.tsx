@@ -107,9 +107,22 @@ type Options = {
   maxTotal: number
   maxPerState: Record<State, number>
   showCurrent: boolean
+  showProgress: boolean
+  progressFormat: string
   subagents: SubagentMode
   icons: Record<State, string>
 }
+
+// The second line of a row with progress, with these placeholders:
+//
+//     {done}     completed items
+//     {total}    items that are not cancelled
+//     {percent}  {done} out of {total}, rounded down, without the % sign
+//     {now}      the first item in progress, or "none"
+//     {more}     " (+N more)" for the other items in progress, or nothing
+//
+// The sidebar is narrow, so what to leave out is the user's call.
+const DEFAULT_PROGRESS_FORMAT = "{done}/{total} ({percent}%) now: {now}{more}"
 
 const DEFAULTS: Options = {
   // A guess, and the one number here with no evidence behind it: long enough to
@@ -127,6 +140,8 @@ const DEFAULTS: Options = {
     idle: Number.POSITIVE_INFINITY,
   },
   showCurrent: false,
+  showProgress: true,
+  progressFormat: DEFAULT_PROGRESS_FORMAT,
   subagents: "section",
   icons: ICONS,
 }
@@ -188,11 +203,109 @@ export function toOptions(raw: Record<string, unknown> | undefined): Options {
     maxPerState,
     icons,
     showCurrent: typeof raw.showCurrent === "boolean" ? raw.showCurrent : DEFAULTS.showCurrent,
+    showProgress: typeof raw.showProgress === "boolean" ? raw.showProgress : DEFAULTS.showProgress,
+    // A blank format would leave a line with nothing on it, so it counts as
+    // not given.
+    progressFormat:
+      typeof raw.progressFormat === "string" && raw.progressFormat.trim() !== ""
+        ? raw.progressFormat
+        : DEFAULTS.progressFormat,
     subagents:
       subagents === "hidden" || subagents === "section" || subagents === "tree" || subagents === "all-tree"
         ? subagents
         : DEFAULTS.subagents,
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* progress                                                                    */
+/* -------------------------------------------------------------------------- */
+
+// The two fields of a todo this plugin reads. The runtime also sends a
+// priority, and the generated types may declare an id the runtime omits, so
+// neither is relied upon.
+type Todo = { content: string; status: string }
+
+export type Summary = {
+  completed: number
+  // Items that are not cancelled. Cancelling an item takes it out of the
+  // count instead of counting it as done.
+  total: number
+  cancelled: number
+  // Null when there is nothing to measure, rather than a made-up 0 or 100.
+  percent: number | null
+  // The first in_progress item in list order, null when none is.
+  current: string | null
+  additionalInProgress: number
+}
+
+// Collapses any run of whitespace, newlines included, so a todo or a title can
+// never turn one row into several.
+export function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim()
+}
+
+// The payload comes from the network, either as the response of the todo
+// endpoint or as a todo.updated event, so nothing about it is trusted: anything
+// that is not a list is rejected as a whole (undefined), and a list item that
+// is not an object is rejected the same way, since silently dropping it would
+// shift every count. An unknown status is kept; it merely never counts as
+// completed.
+export function normalizeTodos(raw: unknown): Todo[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const todos: Todo[] = []
+  for (const item of raw) {
+    if (item === null || typeof item !== "object") return undefined
+    const { content, status } = item as Record<string, unknown>
+    todos.push({
+      content: typeof content === "string" ? content : "",
+      status: typeof status === "string" ? status : "unknown",
+    })
+  }
+  return todos
+}
+
+export function summarize(todos: readonly Todo[]): Summary {
+  let completed = 0
+  let cancelled = 0
+  let current: string | null = null
+  let inProgress = 0
+  for (const todo of todos) {
+    if (todo.status === "cancelled") cancelled++
+    else if (todo.status === "completed") completed++
+    else if (todo.status === "in_progress") {
+      if (current === null) current = oneLine(todo.content)
+      inProgress++
+    }
+  }
+  const total = todos.length - cancelled
+  return {
+    completed,
+    total,
+    cancelled,
+    // Floored, so that only a checklist that is entirely completed reads 100%.
+    percent: total > 0 ? Math.floor((100 * completed) / total) : null,
+    current,
+    additionalInProgress: Math.max(0, inProgress - 1),
+  }
+}
+
+// What a row displays for a summary. Only called for one with items left in
+// it, since an empty or all-cancelled list is shown as no todo at all.
+//
+// Expanded in a single pass, so a placeholder written inside a todo is shown as
+// is and not expanded. Anything in braces that is not a placeholder stays as
+// typed. The result is collapsed to one line, so a format cannot make the row
+// taller.
+export function progressText(summary: Summary, format: string = DEFAULT_PROGRESS_FORMAT): string {
+  const values: Record<string, string> = {
+    done: String(summary.completed),
+    total: String(summary.total),
+    percent: String(summary.percent ?? 0),
+    now: summary.current ?? "none",
+    more: summary.additionalInProgress > 0 ? ` (+${summary.additionalInProgress} more)` : "",
+  }
+  return oneLine(format.replace(/\{(done|total|percent|now|more)\}/g, (_, name: string) => values[name]!))
 }
 
 /* -------------------------------------------------------------------------- */
