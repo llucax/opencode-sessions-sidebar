@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { createMemo, createRoot, createSignal, For, Show } from "solid-js"
+import { createEffect, createMemo, createRoot, createSignal, For, Index, onCleanup, Show, untrack } from "solid-js"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { Session, SessionStatus } from "@opencode-ai/sdk/v2"
 
@@ -740,7 +740,7 @@ export function createModel(api: TuiPluginApi, options: Options) {
 
 // `state` here is the display group, which is one wider than what the model
 // tracks: an idle session lands in `idleFresh` or `idle` depending on its age.
-type Row = {
+export type Row = {
   id: string
   title: string
   state: State
@@ -765,7 +765,8 @@ export function toRow(model: RowSource, session: Session, at: number, current: b
   const since = model.sinceOf(session.id, session.time.updated)
   return {
     id: session.id,
-    title: session.title || session.slug || session.id,
+    // Never the session id, which is not a title, and never more than a line.
+    title: oneLine(session.title ?? "") || "Untitled session",
     state: state === "idle" && at - since <= model.options.idleFreshAge ? "idleFresh" : state,
     since,
     current,
@@ -905,7 +906,50 @@ export function elapsed(ms: number): string {
   return `${Math.floor(hours / 24)}d`.padStart(3)
 }
 
-function SessionRow(props: { api: TuiPluginApi; row: Row; at: number; icons: Record<State, string> }) {
+// Stopped, with nothing left to do: every item that is not cancelled is done.
+function isFinished(row: Row, summary: Summary): boolean {
+  return (row.state === "idleFresh" || row.state === "idle") && summary.percent === 100
+}
+
+// The text of a row, one string per line. Without progress it is the original
+// single line. With it, the first line holds only the icon and the title, and
+// the second the elapsed time and the progress, indented under the title: both
+// are clipped, not wrapped, so the title cannot push the progress out of view
+// and the progress cannot run into the title.
+//
+//     ⏵ W: Update the scraper
+//       ( 8m) 3/8 (37%) now: Add token columns
+//
+// The text after the time is the `progressFormat` option.
+//
+// A session that has stopped with every item done gets the one line again: the
+// second line would say nothing the idle icon does not, and costs a row of a
+// narrow sidebar. One that is still working, waiting or retrying keeps it, since
+// it may be wrapping up after its last item.
+//
+// What is wrong with the progress is said in the parentheses next to the
+// elapsed time, since that is the part that stays visible on a narrow sidebar.
+export function rowLines(
+  row: Row,
+  at: number,
+  icons: Record<State, string>,
+  progress: Progress,
+  progressFormat?: string,
+): string[] {
+  const indent = " ".repeat(row.depth * 2)
+  const time = elapsed(at - row.since)
+  const icon = icons[row.state]
+  if (progress.kind === "summary" && !isFinished(row, progress.summary)) {
+    return [
+      `${indent}${icon} ${row.title}`,
+      `${indent}  (${time}${progress.stale ? ", stale" : ""}) ${progressText(progress.summary, progressFormat)}`,
+    ]
+  }
+  const note = progress.kind === "unavailable" ? ", progress unavailable" : ""
+  return [`${indent}${icon} (${time}${note}) ${row.title}`]
+}
+
+function SessionRow(props: { api: TuiPluginApi; model: Model; row: Row; at: number }) {
   // TuiTheme carries its own `ready` flag, so treat `current` as possibly
   // absent. Returning undefined for a colour just leaves the text unstyled,
   // which is a far better outcome than throwing mid-render.
@@ -934,10 +978,16 @@ function SessionRow(props: { api: TuiPluginApi; row: Row; at: number; icons: Rec
     }
   }
 
-  const line = () =>
-    `${" ".repeat(props.row.depth * 2)}${props.icons[props.row.state]} (${elapsed(props.at - props.row.since)}) ${props.row.title}`
+  const lines = () =>
+    rowLines(
+      props.row,
+      props.at,
+      props.model.options.icons,
+      props.model.progressOf(props.row.id),
+      props.model.options.progressFormat,
+    )
 
-  // Deliberately one <text> for the whole row rather than an aligned row of
+  // Deliberately one <text> for a line of the row rather than an aligned row of
   // separate elements. Siblings in a flex row wrap independently once the
   // sidebar is narrower than the row, which broke the elapsed column across two
   // lines and made it read as part of the title:
@@ -949,12 +999,22 @@ function SessionRow(props: { api: TuiPluginApi; row: Row; at: number; icons: Rec
   // tail of a long title instead of reflowing it. Colour goes on the whole line,
   // since <span> carries no style options, which also makes the state readable
   // at a glance without relying on the emoji.
+  //
+  // Progress makes it two such texts, one under the other, for the same reason
+  // in the other direction: the two parts each get a whole line to be clipped
+  // on, rather than competing for one. Indexed rather than keyed by the text,
+  // so the elapsed time ticking over updates a text in place instead of
+  // replacing it every second.
   return (
-    <text fg={colour()} wrapMode="none">
-      <Show when={props.row.current} fallback={line()}>
-        <b>{line()}</b>
-      </Show>
-    </text>
+    <Index each={lines()}>
+      {(line) => (
+        <text fg={colour()} wrapMode="none">
+          <Show when={props.row.current} fallback={line()}>
+            <b>{line()}</b>
+          </Show>
+        </text>
+      )}
+    </Index>
   )
 }
 
@@ -968,6 +1028,18 @@ function Panel(props: { api: TuiPluginApi; model: Model; sessionID: string }) {
     return tasksOf(props.model, props.sessionID)
   })
 
+  // Tells the model what is on screen, Task rows included, so it fetches the
+  // todos of those and nothing else. Runs on every redraw, which is cheap: the
+  // model only acts on a session it was not already told about.
+  const owner = Symbol(ID)
+  createEffect(() => {
+    const ids = [...rows(), ...tasks()].map((row) => row.id)
+    // The model reads signals of its own on the way, which this must not
+    // subscribe to: only the list of rows is what should trigger it.
+    untrack(() => props.model.setVisible(owner, ids))
+  })
+  onCleanup(() => props.model.setVisible(owner, []))
+
   return (
     <Show when={rows().length > 0 || tasks().length > 0}>
       <box gap={0}>
@@ -976,7 +1048,7 @@ function Panel(props: { api: TuiPluginApi; model: Model; sessionID: string }) {
             <b>Active Sessions</b>
           </text>
           <For each={rows()}>
-            {(row) => <SessionRow api={props.api} row={row} at={props.model.now()} icons={props.model.options.icons} />}
+            {(row) => <SessionRow api={props.api} model={props.model} row={row} at={props.model.now()} />}
           </For>
         </Show>
         <Show when={tasks().length > 0}>
@@ -985,7 +1057,7 @@ function Panel(props: { api: TuiPluginApi; model: Model; sessionID: string }) {
             <b>Current Session Tasks</b>
           </text>
           <For each={tasks()}>
-            {(row) => <SessionRow api={props.api} row={row} at={props.model.now()} icons={props.model.options.icons} />}
+            {(row) => <SessionRow api={props.api} model={props.model} row={row} at={props.model.now()} />}
           </For>
         </Show>
       </box>

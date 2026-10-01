@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { normalizeTodos, oneLine, progressText, summarize, toOptions } from "../sessions-sidebar.tsx"
+import { normalizeTodos, oneLine, progressText, rowLines, summarize, toOptions, toRow } from "../sessions-sidebar.tsx"
+import type { Progress, Row } from "../sessions-sidebar.tsx"
+import type { Session } from "@opencode-ai/sdk/v2"
 
 function todos(...statuses: string[]) {
   return statuses.map((status, index) => ({ content: `item ${index + 1}`, status }))
@@ -183,5 +185,130 @@ describe("progressFormat", () => {
     expect(toOptions({ progressFormat: null }).progressFormat).toBe(fallback)
     expect(toOptions({ progressFormat: "  " }).progressFormat).toBe(fallback)
     expect(toOptions({ progressFormat: "" }).progressFormat).toBe(fallback)
+  })
+})
+
+describe("rowLines", () => {
+  const icons = toOptions(undefined).icons
+  const row = (overrides: Partial<Row> = {}): Row => ({
+    id: "ses_1",
+    title: "W: Update the scraper",
+    state: "working",
+    since: 0,
+    current: false,
+    depth: 0,
+    ...overrides,
+  })
+  const EIGHT_MINUTES = 8 * 60_000
+  const progress = (statuses: string[], stale = false): Progress => ({
+    kind: "summary",
+    summary: summarize(statuses.map((status, index) => ({ content: `item ${index + 1}`, status }))),
+    stale,
+  })
+
+  test("is the original single line without progress", () => {
+    expect(rowLines(row(), EIGHT_MINUTES, icons, { kind: "none" })).toEqual(["\u23F5 ( 8m) W: Update the scraper"])
+  })
+
+  test("splits into the title and, below it, the time and progress", () => {
+    const summary = summarize([
+      { content: "a", status: "completed" },
+      { content: "b", status: "completed" },
+      { content: "c", status: "completed" },
+      { content: "Add token columns", status: "in_progress" },
+      ...Array.from({ length: 4 }, () => ({ content: "p", status: "pending" })),
+    ])
+    expect(rowLines(row(), EIGHT_MINUTES, icons, { kind: "summary", summary, stale: false })).toEqual([
+      "\u23F5 W: Update the scraper",
+      "  ( 8m) 3/8 (37%) now: Add token columns",
+    ])
+  })
+
+  test("indents both lines of a nested row", () => {
+    expect(rowLines(row({ depth: 1 }), EIGHT_MINUTES, icons, progress(["pending"]))).toEqual([
+      "  \u23F5 W: Update the scraper",
+      "    ( 8m) 0/1 (0%) now: none",
+    ])
+  })
+
+  test("says in the parentheses that a list is stale", () => {
+    expect(rowLines(row(), EIGHT_MINUTES, icons, progress(["pending"], true))[1]).toBe(
+      "  ( 8m, stale) 0/1 (0%) now: none",
+    )
+  })
+
+  describe("a finished session", () => {
+    const done = progress(["completed", "completed"])
+
+    test.each(["idle", "idleFresh"] as const)("%s with every item done keeps the one-line row", (state) => {
+      expect(rowLines(row({ state }), EIGHT_MINUTES, icons, done)).toEqual([
+        `${icons[state]} ( 8m) W: Update the scraper`,
+      ])
+    })
+
+    test("counts cancelled items as done, not as outstanding", () => {
+      const lines = rowLines(row({ state: "idle" }), EIGHT_MINUTES, icons, progress(["completed", "cancelled"]))
+      expect(lines).toHaveLength(1)
+    })
+
+    test.each(["working", "waiting", "retry"] as const)("%s with every item done keeps its second line", (state) => {
+      expect(rowLines(row({ state }), EIGHT_MINUTES, icons, done)).toHaveLength(2)
+    })
+
+    test("idle with an item left keeps its second line", () => {
+      const lines = rowLines(row({ state: "idle" }), EIGHT_MINUTES, icons, progress(["completed", "pending"]))
+      expect(lines).toHaveLength(2)
+    })
+
+    test("is indented like any other row", () => {
+      expect(rowLines(row({ state: "idle", depth: 1 }), EIGHT_MINUTES, icons, done)).toEqual([
+        `  ${icons.idle} ( 8m) W: Update the scraper`,
+      ])
+    })
+  })
+
+  test("uses the progress format it is given", () => {
+    expect(rowLines(row(), EIGHT_MINUTES, icons, progress(["completed", "in_progress"]), "{done}/{total} {now}")[1]).toBe(
+      "  ( 8m) 1/2 item 2",
+    )
+  })
+
+  test("says in the parentheses that the progress is unavailable, on one line", () => {
+    expect(rowLines(row(), EIGHT_MINUTES, icons, { kind: "unavailable" })).toEqual([
+      "\u23F5 ( 8m, progress unavailable) W: Update the scraper",
+    ])
+  })
+
+  test("uses the icons option", () => {
+    const custom = toOptions({ icons: { working: "*" } }).icons
+    expect(rowLines(row(), EIGHT_MINUTES, custom, progress(["pending"]))[0]).toBe("* W: Update the scraper")
+  })
+})
+
+describe("toRow titles", () => {
+  const model = {
+    options: toOptions(undefined),
+    sessions: () => [],
+    now: () => 0,
+    stateOf: () => "idle" as const,
+    sinceOf: (_id: string, fallback: number) => fallback,
+  }
+  const session = (title: string): Session => ({
+    id: "ses_1",
+    slug: "brave-moon",
+    projectID: "prj_1",
+    directory: "/tmp/project",
+    title,
+    version: "1",
+    time: { created: 0, updated: 0 },
+  })
+
+  test("is the title, on one line", () => {
+    expect(toRow(model, session("Fix\n  the   bug"), 0, false, 0).title).toBe("Fix the bug")
+  })
+
+  test("is never the session id when there is no title", () => {
+    expect(toRow(model, session(""), 0, false, 0).title).toBe("Untitled session")
+    expect(toRow(model, session("  \n "), 0, false, 0).title).toBe("Untitled session")
   })
 })
