@@ -134,6 +134,70 @@ opencode API records when a session entered its current state. A session first
 seen already idle is dated from when it was last updated, rather than from when
 the plugin noticed it.
 
+### Todo progress
+
+A session with a todo list gets a second line under its title, with how far the
+list has got and what is being worked on, so you can see what a worker is doing
+without opening it or spending a model turn on a report:
+
+    Active Sessions
+    ⏵ W: Update the scraper
+      ( 8m) 3/8 (37%) now: Add token columns
+    ✓ ( 2m) Review PR 412
+
+The numbers count items, not time or effort:
+
+- `3/8` is the completed items out of those that are not cancelled. A cancelled
+  item is neither done nor outstanding, so it never counts as completed. A status
+  the plugin does not know stays in the total and is not completed.
+- The percentage is rounded down, so only a list that is entirely completed
+  reads `100%`. It says how many items are ticked off, not whether the session
+  has finished: a worker can still be wrapping up after its last item.
+- `now:` is the first item that is in progress, and `(+2 more)` follows it when
+  there are others. With none in progress it says `now: none`; it never presents
+  the next pending item as started.
+- A session with no todo list, an empty one, or one where everything is
+  cancelled keeps the one-line row. So does one still waiting for its first
+  answer.
+- A session that has stopped, fresh or not, with every item done also goes back
+  to the one-line row: the line would add little and costs a row of a narrow
+  sidebar. One that is still working, waiting or retrying keeps its line at
+  100%, since it may be wrapping up after its last item.
+
+The todo lists of the sessions on screen, Task rows included, are fetched when
+they first appear, kept current from the `todo.updated` events, and fetched
+again with the periodic resync, which repairs a missed event. Sessions that are
+not shown are not fetched. Each fetch goes to the directory of the session it
+is for, and no more than four run at once.
+
+If a fetch fails and nothing is known yet, the row stays on one line and its
+parentheses say `progress unavailable`. If a list was already known, it stays
+on screen with `stale` in the parentheses until a fetch or an event replaces
+it. Neither can take the sidebar down, and a failure is logged without the todo
+text. Whitespace in a todo or in a title is collapsed so it fits in one line,
+and a session without a title shows as `Untitled session`.
+
+The text after the elapsed time is the `progressFormat` option, with these
+placeholders:
+
+| Placeholder | Expands to                                                          |
+|-------------|---------------------------------------------------------------------|
+| `{done}`    | the completed items                                                 |
+| `{total}`   | the items that are not cancelled                                    |
+| `{percent}` | `{done}` out of `{total}`, rounded down, without the `%` sign        |
+| `{now}`     | the first item in progress, or `none`                               |
+| `{more}`    | `(+N more)` when other items are in progress too, otherwise nothing |
+
+The default is `{done}/{total} ({percent}%) now: {now}{more}`. The sidebar is
+narrow, so you may want less, such as `{done}/{total} {percent}% now: {now}` or
+`{done}/{total} {now}` for no percentage at all. Anything in braces that is not
+a placeholder is shown as typed, a placeholder written inside a todo is not
+expanded, and the result is collapsed to one line. A format that is not a string
+or is blank is ignored.
+
+Set `showProgress` to `false` to get back the plain list: the plugin then
+neither subscribes to `todo.updated` nor requests any todo list.
+
 ### Options
 
 | Option           | Default     | Meaning                                                           |
@@ -144,6 +208,8 @@ the plugin noticed it.
 | `maxTotal`       | unlimited   | cap on rows in the main list                                      |
 | `maxPerState`    | unlimited   | per-group caps: `{ waiting, idleFresh, retry, working, idle }`    |
 | `showCurrent`    | `false`     | pin the session being viewed at the top, bold and accent-coloured |
+| `showProgress`   | `true`      | show how far each session's todo list has got, see below          |
+| `progressFormat` | see below   | the text of the progress line, with `{done}`, `{total}` and more   |
 | `subagents`      | `"section"` | how Task-tool child sessions appear, see below                    |
 | `icons`          | see above   | per-group icon overrides, e.g. `{ "waiting": "!" }`                |
 
