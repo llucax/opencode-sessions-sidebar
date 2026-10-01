@@ -314,7 +314,32 @@ export function progressText(summary: Summary, format: string = DEFAULT_PROGRESS
 
 type Tracked = { state: TrackedState; since: number }
 
+// What is known about a session's todo list. A summary means a list was seen
+// at some point; `failed` means the latest attempt to refresh it did not work,
+// which with no summary is "unavailable" and with one is "stale". A session
+// with no entry at all has not been answered yet.
+type TodoEntry = { summary: Summary | undefined; failed: boolean }
+
+// What a row shows beyond its title and elapsed time. `none` covers every case
+// that keeps the original one-line row: no result yet, no todo list, a list that
+// is empty or all cancelled, and the feature being switched off.
+export type Progress =
+  | { kind: "none" }
+  | { kind: "unavailable" }
+  | { kind: "summary"; summary: Summary; stale: boolean }
+
+const NO_PROGRESS: Progress = { kind: "none" }
+const PROGRESS_UNAVAILABLE: Progress = { kind: "unavailable" }
+
+// Todo requests in flight at once. A busy sidebar can show a dozen sessions at
+// startup, and each request goes to the server of that session's own directory.
+const TODO_CONCURRENCY = 4
+
 type Model = ReturnType<typeof createModel>
+
+// What choosing and building rows reads from the model: not the progress and
+// start/stop parts, which only the rendering and the entry point use.
+type RowSource = Pick<Model, "options" | "sessions" | "now" | "stateOf" | "sinceOf">
 
 // The seam start() takes to control the passage of time, so a test can drive
 // the ticker and the resync interval without waiting on either for real.
@@ -383,6 +408,23 @@ export function createModel(api: TuiPluginApi, options: Options) {
   // the only way to know how long a session has been in a state is to have
   // watched it arrive there.
   const tracked = new Map<string, Tracked>()
+
+  // sessionID -> its todo list's summary. Fed by the todo endpoint and by
+  // todo.updated events, and only ever for the sessions asked for through
+  // setVisible(), which is what keeps the number of requests proportional to
+  // what is on screen rather than to every session of the project.
+  const todoEntries = new Map<string, TodoEntry>()
+  // sessionID -> how many todo.updated events were applied. A fetch started
+  // before an event and answering after it is older than the event, so it is
+  // dropped instead of overwriting the newer list.
+  const todoEvents = new Map<string, number>()
+  // Who is showing which sessions. A map of owners rather than one set, so a
+  // second panel cannot hide the first one's sessions by replacing its list.
+  const visible = new Map<symbol, Set<string>>()
+  const queued: string[] = []
+  const queuedSet = new Set<string>()
+  const inflight = new Set<string>()
+  let disposed = false
 
   function block(sessionID: string, requestID: string) {
     let set = pending.get(sessionID)
@@ -471,7 +513,94 @@ export function createModel(api: TuiPluginApi, options: Options) {
     statuses.delete(sessionID)
     pending.delete(sessionID)
     tracked.delete(sessionID)
+    todoEntries.delete(sessionID)
+    todoEvents.delete(sessionID)
     setRevision((n) => n + 1)
+  }
+
+  function visibleIDs(): Set<string> {
+    const ids = new Set<string>()
+    for (const owned of visible.values()) for (const id of owned) ids.add(id)
+    return ids
+  }
+
+  function setTodos(sessionID: string, todos: readonly Todo[]) {
+    todoEntries.set(sessionID, { summary: summarize(todos), failed: false })
+    setRevision((n) => n + 1)
+  }
+
+  // A failure never erases what is already known: the list stays, marked stale.
+  function failTodos(sessionID: string) {
+    const known = todoEntries.get(sessionID)
+    if (known?.failed) return
+    todoEntries.set(sessionID, { summary: known?.summary, failed: true })
+    setRevision((n) => n + 1)
+  }
+
+  async function loadTodos(sessionID: string) {
+    // The directory picks the server instance that holds the session, so it is
+    // the session's own and not the one this TUI was started in.
+    const session = sessions().find((existing) => existing.id === sessionID)
+    if (!session) return
+    inflight.add(sessionID)
+    const events = todoEvents.get(sessionID) ?? 0
+    let todos: Todo[] | undefined
+    try {
+      const response = await api.client.session.todo(
+        { sessionID, directory: session.directory },
+        { throwOnError: true },
+      )
+      todos = normalizeTodos(response.data)
+      if (!todos) log(api, "warn", "malformed todo list", { sessionID })
+    } catch (error) {
+      // Only the session and the error: a todo list is the user's own text.
+      log(api, "warn", "failed to fetch todos", { sessionID, error: String(error) })
+    }
+    inflight.delete(sessionID)
+    // The answer is stale if an event got there first, and moot if the session
+    // went away or the plugin was disposed in the meantime.
+    if (disposed || (todoEvents.get(sessionID) ?? 0) !== events) return
+    if (!sessions().some((existing) => existing.id === sessionID)) return
+    if (todos) setTodos(sessionID, todos)
+    else failTodos(sessionID)
+  }
+
+  function pumpTodos() {
+    while (!disposed && inflight.size < TODO_CONCURRENCY && queued.length > 0) {
+      const sessionID = queued.shift()!
+      queuedSet.delete(sessionID)
+      void loadTodos(sessionID).finally(pumpTodos)
+    }
+  }
+
+  function requestTodos(sessionID: string) {
+    if (disposed || !options.showProgress) return
+    if (queuedSet.has(sessionID) || inflight.has(sessionID)) return
+    queued.push(sessionID)
+    queuedSet.add(sessionID)
+    pumpTodos()
+  }
+
+  // Tells the model which sessions `owner` is showing. A session that was not
+  // shown before is fetched at once; the resync keeps the rest current.
+  function setVisible(owner: symbol, sessionIDs: readonly string[]) {
+    if (!options.showProgress) return
+    const before = visibleIDs()
+    if (sessionIDs.length === 0) visible.delete(owner)
+    else visible.set(owner, new Set(sessionIDs))
+    for (const sessionID of visibleIDs()) if (!before.has(sessionID)) requestTodos(sessionID)
+  }
+
+  function progressOf(sessionID: string): Progress {
+    // Read first so that whatever is rendering this re-renders when an entry
+    // changes, which the plain Map alone would not trigger.
+    revision()
+    if (!options.showProgress) return NO_PROGRESS
+    const entry = todoEntries.get(sessionID)
+    if (!entry) return NO_PROGRESS
+    if (!entry.summary) return entry.failed ? PROGRESS_UNAVAILABLE : NO_PROGRESS
+    if (entry.summary.total === 0) return NO_PROGRESS
+    return { kind: "summary", summary: entry.summary, stale: entry.failed }
   }
 
   async function resync() {
@@ -490,6 +619,10 @@ export function createModel(api: TuiPluginApi, options: Options) {
       // word for what belongs and remember the id to vet incoming events with.
       projectID ??= list[0]?.projectID
       setSessions(list)
+      // A session that is gone without a deleted event reaching us.
+      const listed = new Set(list.map((existing) => existing.id))
+      for (const sessionID of [...todoEntries.keys()]) if (!listed.has(sessionID)) todoEntries.delete(sessionID)
+      for (const sessionID of [...todoEvents.keys()]) if (!listed.has(sessionID)) todoEvents.delete(sessionID)
     }
 
     if (status) {
@@ -510,6 +643,10 @@ export function createModel(api: TuiPluginApi, options: Options) {
     }
 
     sync()
+
+    // Repairs a todo.updated event that was missed, and retries a request that
+    // failed. Only the sessions on screen; the rest are fetched on appearing.
+    for (const sessionID of visibleIDs()) requestTodos(sessionID)
 
     const counts: Record<string, number> = {}
     for (const session of sessions()) {
@@ -550,6 +687,22 @@ export function createModel(api: TuiPluginApi, options: Options) {
       api.event.on("session.deleted", (event) => remove(event.properties.sessionID)),
     ]
 
+    // Not subscribed at all with progress switched off, so that the option
+    // restores the old behaviour rather than merely hiding the result.
+    if (options.showProgress) {
+      unsubscribe.push(
+        api.event.on("todo.updated", (event) => {
+          const sessionID = event.properties.sessionID
+          // Events are not scoped to a project, so only this one's sessions.
+          if (!sessions().some((existing) => existing.id === sessionID)) return
+          const todos = normalizeTodos(event.properties.todos)
+          if (!todos) return
+          todoEvents.set(sessionID, (todoEvents.get(sessionID) ?? 0) + 1)
+          setTodos(sessionID, todos)
+        }),
+      )
+    }
+
     ticker = clock.setInterval(() => setNow(clock.now()), TICK_INTERVAL)
     resyncer = clock.setInterval(() => void resync(), RESYNC_INTERVAL)
 
@@ -557,6 +710,10 @@ export function createModel(api: TuiPluginApi, options: Options) {
   }
 
   function dispose() {
+    disposed = true
+    queued.length = 0
+    queuedSet.clear()
+    visible.clear()
     if (ticker !== undefined) clock.clearInterval(ticker)
     if (resyncer !== undefined) clock.clearInterval(resyncer)
     for (const off of unsubscribe) off()
@@ -570,6 +727,8 @@ export function createModel(api: TuiPluginApi, options: Options) {
     revision,
     start,
     dispose,
+    setVisible,
+    progressOf,
     stateOf: (sessionID: string): TrackedState => tracked.get(sessionID)?.state ?? "idle",
     sinceOf: (sessionID: string, fallback: number): number => tracked.get(sessionID)?.since ?? fallback,
   }
@@ -601,7 +760,7 @@ type Row = {
 // `now - since` instead is idempotent, and costs only a re-sort of a handful of
 // rows a second, which `select()` gets for free by already reading
 // `model.now()`.
-export function toRow(model: Model, session: Session, at: number, current: boolean, depth: number): Row {
+export function toRow(model: RowSource, session: Session, at: number, current: boolean, depth: number): Row {
   const state = model.stateOf(session.id)
   const since = model.sinceOf(session.id, session.time.updated)
   return {
@@ -636,7 +795,7 @@ export function grouped(rows: Row[]): Row[] {
   return STATES.flatMap((state) => order(state, byState.get(state)!))
 }
 
-export function select(model: Model, currentID: string): Row[] {
+export function select(model: RowSource, currentID: string): Row[] {
   const options = model.options
   const at = model.now()
   const showTree = options.subagents === "tree" || options.subagents === "all-tree"
@@ -716,7 +875,7 @@ export function select(model: Model, currentID: string): Row[] {
   return picked.slice(0, options.maxTotal)
 }
 
-export function tasksOf(model: Model, currentID: string): Row[] {
+export function tasksOf(model: RowSource, currentID: string): Row[] {
   if (model.options.subagents !== "section") return []
   const at = model.now()
   const rows: Row[] = []
