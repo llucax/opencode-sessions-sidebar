@@ -3,7 +3,7 @@ import type { Event, PermissionRequest, QuestionRequest, Session, SessionStatus 
 
 // The narrow slice of TuiPluginApi the two plugin cores actually touch once
 // construction is split from starting: event.on, client.app.log,
-// client.session.list/status, client.permission.list, client.question.list,
+// client.session.list/status/todo, client.permission.list, client.question.list,
 // state.path.directory, state.session.get/status, route.current/navigate,
 // ui.toast, ui.dialog.clear and renderer.terminalWidth. theme.current is only
 // read by the components, which are out of scope (see the README's Tier 3
@@ -22,6 +22,7 @@ type Narrow = {
     session: {
       list: TuiPluginApi["client"]["session"]["list"]
       status: TuiPluginApi["client"]["session"]["status"]
+      todo: TuiPluginApi["client"]["session"]["todo"]
     }
     permission: { list: TuiPluginApi["client"]["permission"]["list"] }
     question: { list: TuiPluginApi["client"]["question"]["list"] }
@@ -72,7 +73,19 @@ export function createFakeApi() {
     sessionStatus: {} as Record<string, SessionStatus>,
     permissions: [] as PermissionRequest[],
     questions: [] as QuestionRequest[],
+    todos: {} as Record<string, unknown>,
   }
+
+  // What client.session.todo does. By default it answers from `responses.todos`
+  // (an empty list for a session not mentioned) and records the call; a test
+  // replaces `handler` to fail a request or to hold it until it says so.
+  type TodoCall = { sessionID: string; directory: string | undefined }
+  const todoCalls: TodoCall[] = []
+  const todoRequests = {
+    handler: async (call: TodoCall): Promise<unknown> => responses.todos[call.sessionID] ?? [],
+  }
+  let todosInFlight = 0
+  let todosPeak = 0
 
   let directory: string | undefined = "/tmp/project"
   let route: TuiRouteCurrent = { name: "home" }
@@ -99,6 +112,18 @@ export function createFakeApi() {
       session: {
         list: (async () => ({ data: responses.sessionList })) as TuiPluginApi["client"]["session"]["list"],
         status: (async () => ({ data: responses.sessionStatus })) as TuiPluginApi["client"]["session"]["status"],
+        todo: (async (params: TodoCall) => {
+          const call = { sessionID: params.sessionID, directory: params.directory }
+          todoCalls.push(call)
+          todosInFlight += 1
+          todosPeak = Math.max(todosPeak, todosInFlight)
+          try {
+            // Mirrors throwOnError: a failing handler rejects.
+            return { data: await todoRequests.handler(call) }
+          } finally {
+            todosInFlight -= 1
+          }
+        }) as unknown as TuiPluginApi["client"]["session"]["todo"],
       },
       permission: {
         list: (async () => ({ data: responses.permissions })) as TuiPluginApi["client"]["permission"]["list"],
@@ -159,6 +184,9 @@ export function createFakeApi() {
     sessions,
     statuses,
     responses,
+    todoCalls,
+    todoRequests,
+    todosPeak: () => todosPeak,
     setDirectory: (value: string | undefined) => {
       directory = value
     },
