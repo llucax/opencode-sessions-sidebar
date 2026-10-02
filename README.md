@@ -55,6 +55,14 @@ The symlinks are a convenience, not a requirement: pointing `plugin` straight at
 the files in the checkout works too. They buy you a `tui.jsonc` that does not
 mention where your checkouts live.
 
+That also works as the whole install method, not just a workaround: skip the
+symlink step entirely and point every `plugin` entry straight at the checkout,
+absolute or relative to the directory holding `tui.jsonc` (for example
+`../../opencode-plugins/sessions-watch/sessions-sidebar.tsx` if the clone
+lives in `~/opencode-plugins/`). It is worth it when you would rather not keep
+symlinks in sync with the checkout. Options attach the same way, with the
+checkout path in the array form shown below.
+
 Restart opencode.
 
 > [!IMPORTANT]
